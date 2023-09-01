@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 
 
 class Defaults:
-    TIMEOUT = 1
+    TIMEOUT = 0.01
     SLEEP_TIME = 0
     IGNORE_WAIT = True
     NON_BLOCKING = False
@@ -18,68 +18,97 @@ class Defaults:
     DAEMON = False
 
 
-class ServerThread(threading.Thread):
+def create_socket(ignore_wait=Defaults.IGNORE_WAIT, timeout=Defaults.TIMEOUT, non_blocking=Defaults.NON_BLOCKING):
+    result = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
-    def __init__(self, port, daemon=Defaults.DAEMON, timeout=Defaults.TIMEOUT, sleep_time=Defaults.SLEEP_TIME, ignore_wait=Defaults.IGNORE_WAIT, non_blocking=Defaults.NON_BLOCKING, buffer_size=Defaults.BUFFER_SIZE):
-        threading.Thread.__init__(self)
-        self.server = socket.gethostname()
-        self.port = port
-        self.timeout = timeout
-        self.sleep_time = sleep_time
-        self.ignore_wait = ignore_wait
-        self.non_blocking = non_blocking
-        self.buffer_size = buffer_size
-        self.daemon = daemon
+    if ignore_wait:
+        result.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-    def run(self):
-        pass
+    result.setblocking(not non_blocking)
+
+    if timeout > 0:
+        result.settimeout(timeout)
+
+    return result
+
+
+def run_client(client_socket, server, port, process_data=lambda x: "Do nothing\n", buffer_size=Defaults.BUFFER_SIZE, sleep_time=Defaults.SLEEP_TIME):
+    try:
+        logger.debug(
+            "Connecting to tcp://{}:{}".format(args.server, args.port))
+        client_socket.connect((server, port))
+    except Exception as e:
+        logger.error(
+            "Failed to connect to tcp://{}:{}: {}".format(server, port, str(e)))
+        return
+
+    while True:
+        try:
+            data = client_socket.recv(buffer_size)
+            if not data:
+                break
+            reply = process_data(data)
+
+            if reply:
+                client_socket.sendall(reply.encode(Defaults.ENCODING))
+
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+        except TimeoutError:
+            continue
+        except KeyboardInterrupt:
+            logger.info("Shutting down server")
+            break
+        except Exception as e:
+            logger.error(
+                "Communication error with tcp://{}:{}: {} {}".format(server, port, str(e)))
+
+    client_socket.close()
 
 
 class ClientThread(threading.Thread):
-    def __init__(self, server, port, timeout=Defaults.TIMEOUT, sleep_time=Defaults.SLEEP_TIME, ignore_wait=Defaults.IGNORE_WAIT, non_blocking=Defaults.NON_BLOCKING, buffer_size=Defaults.BUFFER_SIZE):
+
+    def __init__(self, client: socket.socket, stop_event: threading.Event, process_data, sleep_time=Defaults.BUFFER_SIZE, buffer_size=Defaults.BUFFER_SIZE):
         threading.Thread.__init__(self)
-        self.server = server
-        self.port = port
-        self.timeout = timeout
-        self.sleep_time = sleep_time
-        self.ignore_wait = ignore_wait
-        self.non_blocking = non_blocking
         self.buffer_size = buffer_size
+        self.sleep_time = sleep_time
+        self.stop_event = stop_event
 
     def run(self):
-        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        if self.ignore_wait:
-            client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if self.timeout > 0:
-            client_socket.settimeout(self.timeout)
-
-        try:
-            client_socket.connect((self.server, self.port))
-        except Exception as e:
-            logger.error(
-                "Failed to connect to tcp://{}:{}: {}".format(self.server, self.port, str(e)))
-            return
-
         while True:
-            try:
-                data = client_socket.recv(self.buffer_size)
-                if not data:
-                    break
-                reply = self.process_data(data)
+            pass
 
-                if reply:
-                    client_socket.sendall(reply.encode(Defaults.ENCODING))
 
-                if self.sleep_time > 0:
-                    time.sleep(self.sleep_time)
-            except Exception as e:
-                logger.error(
-                    "Communication error with tcp://{}:{}: {}".format(self.server, self.port, str(e)))
+def run_server(server_socket: socket.socket, port: int, process_data=lambda x: "Server does nothing\n", timeout=Defaults.timeout, backlog=Defaults.BACKLOG_SIZE, buffer_size=Defaults.BUFFER_SIZE, sleep_time=Defaults.SLEEP_TIME):
+    try:
 
-        client_socket.close()
+        logger.debug(
+            "Binding on tcp://{}:{}".format(socket.gethostname(), port))
+        server_socket.bind((socket.gethostname(), port))
+    except Exception as e:
+        logger.error(
+            "Failed to bind on tcp://{}:{}: {}".format(socket.gethostname(), port, str(e)))
+        return
 
-    def process_data(self, data):
-        return "Do Nothing\n"
+    if backlog > 0:
+        server_socket.listen(backlog)
+
+    stop_event = threading.Event()
+    while True:
+
+        client, address = server_socket.accept()
+        logger.debug(
+            "Connection from tcp://{}:{}".format(address[0], address[1]))
+
+        if timeout > 0:
+            client.settimeout(timeout)
+        ClientThread(client, stop_event, process_data,
+                     sleep_time=sleep_time, buffer_size=buffer_size).start()
+
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+        break
+    server_socket.close()
 
 
 if __name__ == "__main__":
@@ -122,12 +151,11 @@ if __name__ == "__main__":
     args = argument_parser.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.ERROR)
 
+    socket = create_socket(ignore_wait=args.ignore_wait,
+                           timeout=args.timeout, non_blocking=args.non_blocking)
+
     if args.server is None:
         logger.debug("Starting server on port {}".format(args.port))
     else:
-        logger.debug(
-            "Connection to tcp://{}:{}".format(args.server, args.port))
-        thread = ClientThread(args.server, args.port, args.timeout, args.sleep_time,
-                              args.ignore_wait, args.non_blocking, args.buffer_size)
-        thread.start()
-        thread.join()
+        run_client(socket, args.server, args.port,
+                   buffer_size=args.buffer_size, sleep_time=args.sleep_time)
